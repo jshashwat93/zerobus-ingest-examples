@@ -1,0 +1,3 @@
+# Rendered by setup.sh and holds the service principal secret.
+conf/application.properties
+.env
