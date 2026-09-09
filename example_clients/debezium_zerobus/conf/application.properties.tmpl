@@ -1,0 +1,77 @@
+# Debezium Server: SQL Server CDC into Databricks Zerobus.
+#
+# setup.sh renders this into application.properties, substituting every
+# __PLACEHOLDER__ from .env. Edit this template, not the rendered file.
+
+# ---- Source: SQL Server ----------------------------------------------------
+debezium.source.connector.class=io.debezium.connector.sqlserver.SqlServerConnector
+debezium.source.database.hostname=sqlserver
+debezium.source.database.port=1433
+debezium.source.database.user=__DBZ_SQL_USER__
+debezium.source.database.password=__DBZ_SQL_PASSWORD__
+debezium.source.database.names=__MSSQL_DATABASE__
+debezium.source.topic.prefix=cdc
+debezium.source.table.include.list=dbo.orders,dbo.customers
+debezium.source.snapshot.mode=initial
+
+# The demo server presents a self-signed certificate.
+debezium.source.database.encrypt=false
+debezium.source.driver.encrypt=false
+debezium.source.driver.trustServerCertificate=true
+
+# Offsets and schema history live on a named volume, so restarting Debezium
+# resumes from the last committed position instead of snapshotting again.
+debezium.source.offset.storage.file.filename=/debezium/data/offsets.dat
+debezium.source.offset.flush.interval.ms=1000
+debezium.source.schema.history.internal=io.debezium.storage.file.history.FileSchemaHistory
+debezium.source.schema.history.internal.file.filename=/debezium/data/schema-history.dat
+
+# Send DECIMAL as exact text, which is what Zerobus writes into a DECIMAL column.
+debezium.source.decimal.handling.mode=string
+
+# ---- Transforms ------------------------------------------------------------
+# unwrap collapses the change event down to the row itself, which is what typed
+# mode consumes. Two things to know about it:
+#
+#  1. The class lives in lib_opt/, and the container image only puts lib_opt on
+#     the classpath when ENABLE_DEBEZIUM_SCRIPTING=true. That variable is set in
+#     docker-compose.yml. Without it, startup fails with ClassNotFoundException.
+#  2. rewrite mode adds a __deleted column carrying the STRING "true" or "false",
+#     not a BOOLEAN. The target column has to be STRING.
+debezium.transforms=unwrap,route
+debezium.transforms.unwrap.type=io.debezium.transforms.ExtractNewRecordState
+debezium.transforms.unwrap.delete.tombstone.handling.mode=rewrite
+
+# Debezium names each destination after the source object. Because this config
+# uses database.names (its multi-database form), the destination carries the
+# database too: cdc.inventory.dbo.orders, four parts rather than three. Zerobus
+# needs a three-part Unity Catalog name, so rewrite it.
+#
+# Worth knowing: if this pattern does not match, nothing is routed and nothing is
+# ingested, and Debezium reports no error at all. A silent pipeline with a healthy
+# log is almost always this line.
+debezium.transforms.route.type=org.apache.kafka.connect.transforms.RegexRouter
+debezium.transforms.route.regex=cdc\\.[^.]+\\.dbo\\.(.*)
+debezium.transforms.route.replacement=__UC_CATALOG__.__UC_SCHEMA__.$1
+
+# ---- Format ----------------------------------------------------------------
+# Zerobus accepts JSON objects matching the target table, so schemas are off.
+debezium.format.value=json
+debezium.format.value.schemas.enable=false
+debezium.format.key=json
+debezium.format.key.schemas.enable=false
+
+# ---- Sink: Databricks Zerobus ---------------------------------------------
+debezium.sink.type=zerobus
+debezium.sink.zerobus.endpoint=__ZEROBUS_ENDPOINT__
+debezium.sink.zerobus.workspace.url=https://__WORKSPACE_URL__
+debezium.sink.zerobus.client.id=__SP_CLIENT_ID__
+# The OAuth secret deliberately does not live in this file. docker-compose.yml passes
+# it in as DEBEZIUM_SINK_ZEROBUS_CLIENT_SECRET, which Quarkus maps onto
+# debezium.sink.zerobus.client.secret. That keeps the only real credential out of a
+# file the container has to be able to read.
+debezium.sink.zerobus.record.format=json
+debezium.sink.zerobus.metrics.log.interval=50
+
+quarkus.log.console.json=false
+quarkus.log.level=INFO

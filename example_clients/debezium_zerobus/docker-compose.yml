@@ -1,0 +1,110 @@
+# SQL Server -> Debezium Server -> Databricks Zerobus -> Delta.
+#
+# Run ./setup.sh <cli-profile> first: it creates the Unity Catalog target and
+# renders conf/application.properties, which the debezium service mounts.
+#
+# On `platform: linux/amd64` below: Microsoft publishes SQL Server container
+# images for x86-64 only. Pinning the platform makes Docker emulate it on arm64
+# hosts, which is what Apple Silicon needs (Docker Desktop uses Rosetta; Colima
+# needs --vz-rosetta). On x86-64 hosts the pin is a no-op. Debezium's image is
+# multi-arch and always runs natively.
+
+services:
+  sqlserver:
+    image: mcr.microsoft.com/mssql/server:2022-latest
+    platform: linux/amd64
+    hostname: sqlserver
+    restart: unless-stopped
+    environment:
+      ACCEPT_EULA: "Y"
+      MSSQL_SA_PASSWORD: ${MSSQL_SA_PASSWORD:?set MSSQL_SA_PASSWORD in .env}
+      MSSQL_PID: Developer
+      # CDC capture and cleanup are SQL Server Agent jobs. Without Agent the
+      # tables report as CDC-enabled and nothing is ever captured.
+      MSSQL_AGENT_ENABLED: "true"
+    ports:
+      - "1433:1433"
+    volumes:
+      - mssql_data:/var/opt/mssql
+    healthcheck:
+      # Engine reachability is not enough, because CDC silently does nothing
+      # until Agent is up. Wait for Agent specifically.
+      test:
+        - CMD-SHELL
+        - >-
+          /opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P "$$MSSQL_SA_PASSWORD" -C -b
+          -Q "SET NOCOUNT ON; IF NOT EXISTS (SELECT 1 FROM sys.dm_server_services
+              WHERE servicename LIKE 'SQL Server Agent%' AND status_desc = 'Running')
+              RAISERROR('agent not running', 16, 1)"
+      interval: 10s
+      timeout: 10s
+      retries: 40
+      start_period: 30s
+
+  db-init:
+    image: mcr.microsoft.com/mssql/server:2022-latest
+    platform: linux/amd64
+    restart: "no"
+    depends_on:
+      sqlserver:
+        condition: service_healthy
+    env_file: .env
+    volumes:
+      - ./sqlserver:/scripts:ro
+    entrypoint:
+      - /opt/mssql-tools18/bin/sqlcmd
+      - -S
+      - sqlserver
+      - -U
+      - sa
+      - -P
+      - ${MSSQL_SA_PASSWORD:?}
+      - -C
+      - -b
+      - -v
+      - DB=${MSSQL_DATABASE:-inventory}
+      - -v
+      - DBZ_USER=${DEBEZIUM_SQL_USER:-debezium}
+      - -v
+      - DBZ_PASSWORD=${DEBEZIUM_SQL_PASSWORD:?}
+      - -i
+      - /scripts/init.sql
+
+  debezium:
+    image: quay.io/debezium/server:3.7.0.Beta1
+    hostname: debezium
+    init: true
+    restart: unless-stopped
+    depends_on:
+      db-init:
+        condition: service_completed_successfully
+    environment:
+      # This does more than its name suggests: it is the switch that puts
+      # lib_opt/* on the classpath. ExtractNewRecordState lives there, so typed
+      # mode fails with ClassNotFoundException without it.
+      ENABLE_DEBEZIUM_SCRIPTING: "true"
+      # Quarkus maps this onto debezium.sink.zerobus.client.secret, keeping the
+      # OAuth secret out of the properties file the container mounts.
+      DEBEZIUM_SINK_ZEROBUS_CLIENT_SECRET: ${DATABRICKS_CLIENT_SECRET:?set DATABRICKS_CLIENT_SECRET in .env, or let setup.sh create a service principal}
+    volumes:
+      - ./conf/application.properties:/debezium/config/application.properties:ro
+      - debezium_data:/debezium/data
+    ports:
+      - "8080:8080"
+
+  loadgen:
+    image: mcr.microsoft.com/mssql/server:2022-latest
+    platform: linux/amd64
+    init: true
+    restart: unless-stopped
+    depends_on:
+      db-init:
+        condition: service_completed_successfully
+    env_file: .env
+    volumes:
+      - ./sqlserver:/scripts:ro
+    entrypoint: ["/usr/bin/bash", "/scripts/loadgen.sh"]
+
+volumes:
+  mssql_data:
+  debezium_data:
